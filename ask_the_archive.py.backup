@@ -1,0 +1,147 @@
+import streamlit as st
+import openai
+import faiss
+import json
+import numpy as np
+import pathlib
+import tempfile
+import streamlit.components.v1 as components
+import os
+
+from moviepy.editor import VideoFileClip
+import imageio_ffmpeg
+
+# ✅ OpenAI client setup (new syntax)
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Paths
+INDEX_FILE = "faiss_index.index"
+METADATA_FILE = "chunk_metadata.json"
+VIDEO_FOLDER = "."
+
+# Load FAISS index + metadata
+index = faiss.read_index(INDEX_FILE)
+with open(METADATA_FILE, "r", encoding="utf-8") as f:
+    metadata = json.load(f)
+
+# Parse SRT timecode to seconds
+def parse_srt_timecode(ts: str):
+    h, m, s = ts.replace(",", ".").split(":")
+    return float(h) * 3600 + float(m) * 60 + float(s)
+
+# Clip video dynamically using moviepy
+def clip_video_segment(filename, start_sec, duration):
+    clip_path = pathlib.Path(filename)
+    if not clip_path.exists():
+        print(f"❌ File not found: {clip_path}")
+        return None
+    try:
+        clip = VideoFileClip(str(clip_path)).subclip(start_sec, start_sec + duration)
+        tmpfile = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        clip.write_videofile(tmpfile.name, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        return tmpfile.name
+    except Exception as e:
+        print(f"❌ Error generating clip: {e}")
+        return None
+
+# Embedding lookup (updated syntax)
+def embed_query(query: str) -> np.ndarray:
+    res = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=query
+    )
+    return np.array(res.data[0].embedding, dtype=np.float32).reshape(1, -1)
+
+# Semantic search
+def search(query, k=3):
+    vec = embed_query(query)
+    distances, indices = index.search(vec, k)
+    return [metadata[i] for i in indices[0]]
+
+# GPT summary (updated syntax)
+@st.cache_data(show_spinner=False)
+def summarize_with_gpt(text):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Summarize this Holocaust survivor testimony excerpt in 1–2 sentences."},
+                {"role": "user", "content": text}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ Summary failed: {e}"
+
+# UI
+st.title("🎥 Ask al Viejo Loco")
+query = st.text_input("Ask a question:", placeholder="e.g. ¿Dónde menciona el gueto de Varsovia?")
+clip_duration = st.slider("Clip length (seconds):", min_value=10, max_value=120, value=60, step=10)
+
+if query:
+    st.success("Searching...")
+
+    try:
+        results = search(query, k=3)
+    except Exception as e:
+        st.error(f"❌ OpenAI search error: {e}")
+        results = []
+
+    st.markdown("## 🎯 Top Matches")
+
+    for i, result in enumerate(results, 1):
+        st.markdown(f"### Match #{i}")
+        st.markdown(f"**Timestamp:** {result['start']} → {result['end']}")
+        st.markdown(f"**Video File:** `{result['video']}`")
+
+        with st.spinner("Summarizing..."):
+            summary = summarize_with_gpt(result["text"])
+        st.markdown(f"**🧠 Summary:** {summary}")
+
+        # Clip and play
+        start_sec = parse_srt_timecode(result['start'])
+        video_file = result['video']  # expects `shrunk_*.mp4` to be present
+        video_path = pathlib.Path(VIDEO_FOLDER) / video_file
+
+        if video_path.exists():
+            clipped = clip_video_segment(video_path, start_sec, clip_duration)
+            if clipped:
+                st.video(clipped)
+            else:
+                st.warning("⚠️ Could not generate video clip.")
+        else:
+            st.warning(f"⚠️ Video not found: {video_file}")
+
+        # Transcript
+        video_stem = result['video'].replace(".mp4", "")
+        srt_path = pathlib.Path("transcripts") / f"{video_stem}.srt"
+
+        if srt_path.exists():
+            with srt_path.open("r", encoding="utf-8") as f:
+                blocks = f.read().strip().split("\n\n")
+
+            html_transcript = ""
+            for block in blocks:
+                lines = block.strip().splitlines()
+                if len(lines) < 3:
+                    continue
+                start, end = lines[1].split(" --> ")
+                text = " ".join(lines[2:])
+                is_match = (start == result['start'] and end == result['end'])
+                if is_match:
+                    html_transcript += f"<div style='background-color:#ffe0e0; padding:6px; margin-bottom:6px; border-left:4px solid #e91e63'><b>{start} → {end}</b><br><b>{text}</b></div>"
+                else:
+                    html_transcript += f"<div style='padding:4px; margin-bottom:4px;'><i>{start} → {end}</i><br>{text}</div>"
+
+            st.markdown("#### 📜 Full Transcript")
+            components.html(
+                f"""
+                <div style='max-height: 300px; overflow-y: auto; background-color: #fdfdfd; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; line-height: 1.4'>
+                    {html_transcript}
+                </div>
+                """,
+                height=320,
+                scrolling=True
+            )
+        else:
+            st.info("Transcript not found.")
